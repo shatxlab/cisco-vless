@@ -16,7 +16,9 @@ if [ "$(uname -s)" = Linux ]; then
 else
 	# shellcheck source=/dev/null
 	user=$(. "$ETC/config" 2>/dev/null && echo "${CISCO_USER:-}")
-	[ -n "$user" ] && security delete-generic-password -s cvpn -a "$user" >/dev/null 2>&1
+	[ -n "$user" ] && for a in "$user" "$user:totp"; do
+		security delete-generic-password -s cvpn -a "$a" >/dev/null 2>&1
+	done
 fi
 
 $SUDO rm -rf "$LIB" "$ETC"

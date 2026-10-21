@@ -17,13 +17,14 @@
 #   cvpn vless boot on|off   Linux: поднимать vless при загрузке
 #   cvpn wg on|off
 #   cvpn password            сменить пароль Cisco
+#   cvpn totp                сохранить секрет TOTP: код для cisco подставится сам
 #   cvpn log                 логи cisco и vless
 
 LIB=/usr/local/lib/cvpn
 ETC=/usr/local/etc/cvpn
 SELF="$LIB/cvpn"
 
-usage() { sed -n '12,21p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '12,22p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 if [ ! -f "$ETC/config" ]; then
 	echo "cvpn не установлен: нет $ETC/config. Запусти install.sh"
@@ -39,6 +40,7 @@ is_mac() { [ "$OS" = Darwin ]; }
 
 KEYCHAIN_SERVICE=cvpn
 PASSWORD_FILE="$ETC/cisco-password"
+TOTP_FILE="$ETC/cisco-totp"
 CISCO_PID=/var/run/cvpn-cisco.pid
 CISCO_LOG=/var/log/cvpn-cisco.log
 DNS_STATE=/var/run/cvpn-dns-domains
@@ -51,7 +53,7 @@ WG_IF=cvpn-wg
 # Управляющие команды требуют root — поднимаемся через sudo сами.
 case "${1:-status}" in
 	status|log|help|-h|--help) ;;
-	password) is_mac || [ "$(id -u)" -eq 0 ] || exec sudo "$SELF" "$@" ;;
+	password|totp) is_mac || [ "$(id -u)" -eq 0 ] || exec sudo "$SELF" "$@" ;;
 	*) [ "$(id -u)" -eq 0 ] || exec sudo "$SELF" "$@" ;;
 esac
 
@@ -111,14 +113,24 @@ resolve_ip() {
 	dig +short +time=3 +tries=1 "$1" 2>/dev/null | grep -E '^[0-9.]+$' | head -1
 }
 
-cisco_password() {
+# Секрет из Keychain (macOS, аккаунт $1) или из root-only файла $2 (Linux).
+secret_get() {
 	if is_mac; then
 		local user="${SUDO_USER:-}"
 		[ -n "$user" ] || return 1
-		sudo -u "$user" -H security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$CISCO_USER" -w 2>/dev/null
+		sudo -u "$user" -H security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null
 	else
-		[ -s "$PASSWORD_FILE" ] && cat "$PASSWORD_FILE"
+		[ -s "$2" ] && cat "$2"
 	fi
+}
+
+cisco_password() { secret_get "$CISCO_USER" "$PASSWORD_FILE"; }
+
+# Текущий код TOTP, если секрет сохранён (cvpn totp).
+cisco_totp() {
+	local secret
+	secret=$(secret_get "$CISCO_USER:totp" "$TOTP_FILE") || return 1
+	printf '%s' "$secret" | perl "$LIB/totp.pl"
 }
 
 # Снять split-DNS, если openconnect умер, не дойдя до disconnect.
@@ -143,6 +155,9 @@ cisco_on() {
 	fi
 
 	local otp="${1:-}"
+	if [ -z "$otp" ] && otp=$(cisco_totp); then
+		echo "cisco: otp из сохранённого секрета TOTP"
+	fi
 	[ -n "$otp" ] || read -rp 'OTP (Enter, если не нужен): ' otp
 
 	local ip gw dev
@@ -312,6 +327,25 @@ password() {
 	fi
 }
 
+totp() {
+	local secret code
+	echo "Секрет TOTP для $CISCO_USER: base32 или ссылка otpauth://... (из QR-кода)"
+	read -rsp "Секрет: " secret
+	echo
+	[ -n "$secret" ] || { echo "пустой секрет, не сохраняю"; exit 1; }
+	# Проверим формат и покажем код — его можно сверить с телефоном.
+	code=$(printf '%s' "$secret" | perl "$LIB/totp.pl") || exit 1
+	if is_mac; then
+		if [ "$(id -u)" -eq 0 ]; then echo "запускай без sudo: секрет кладётся в твой Keychain"; exit 1; fi
+		security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$CISCO_USER:totp" -w "$secret" || exit 1
+		echo "сохранён в Keychain"
+	else
+		(umask 077; printf '%s' "$secret" > "$TOTP_FILE")
+		echo "сохранён в $TOTP_FILE (читает только root)"
+	fi
+	echo "Текущий код: $code — сверь с приложением"
+}
+
 sub_cmd() {
 	case "${2:-}" in
 		on)   "$1_on" "${@:3}" ;;
@@ -329,6 +363,7 @@ case "${1:-status}" in
 	vless)    sub_cmd vless "${@:2}" ;;
 	wg)       sub_cmd wg "${@:2}" ;;
 	password) password ;;
+	totp)     totp ;;
 	log)
 		echo "== cisco ($CISCO_LOG)"
 		tail -20 "$CISCO_LOG" 2>/dev/null

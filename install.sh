@@ -13,6 +13,9 @@
 #   CVPN_VLESS_LINK       ссылка vless://...
 #   CVPN_WG_CONF          путь к конфигу WireGuard, можно пусто
 #   CVPN_CISCO_PASSWORD   пароль Cisco (только Linux; на macOS — Keychain)
+#   CVPN_CISCO_TOTP       секрет TOTP (base32 или otpauth://...), можно пусто:
+#                         тогда otp для Cisco подставляется сам (на macOS
+#                         задаётся через cvpn totp)
 #   CVPN_VLESS_BOOT=1     Linux: поднимать vless при загрузке
 #   CVPN_SUDOERS=1        разрешить cvpn через sudo без пароля
 #   CVPN_YES=1            не спрашивать подтверждений
@@ -175,6 +178,7 @@ PATH="${EXTRA_PATH:+$EXTRA_PATH:}$PATH" sing-box check -c "$tmp/singbox.json" ||
 say "Файлы: $LIB, $ETC, /usr/local/bin/cvpn"
 $SUDO mkdir -p "$LIB" "$ETC" /usr/local/bin
 $SUDO install -m 755 bin/cvpn lib/vpnc-wrapper.sh "$LIB/"
+$SUDO install -m 755 lib/totp.pl "$LIB/"
 $SUDO install -m 644 "$tmp/config" "$ETC/config"
 $SUDO install -m 600 "$tmp/singbox.json" "$ETC/singbox.json"
 if [ -n "$WG_CONF" ]; then $SUDO install -m 600 "$WG_CONF" "$ETC/cvpn-wg.conf"; fi
@@ -215,6 +219,24 @@ else
 	$SUDO /usr/local/bin/cvpn password
 fi
 
+# --- TOTP Cisco -------------------------------------------------------------
+
+# Секрет — это то, что показывает QR-код при настройке аутентификатора
+# (поле secret= в otpauth://...). Без него otp вводится руками.
+if [ "$OS" = Linux ]; then
+	ask CISCO_TOTP "Секрет TOTP Cisco (base32 или otpauth://..., Enter — вводить otp руками)" "" secret
+	if [ -n "$CISCO_TOTP" ]; then
+		code=$(printf '%s' "$CISCO_TOTP" | perl lib/totp.pl) || die "секрет TOTP не разобран"
+		(umask 077; printf '%s' "$CISCO_TOTP" | $SUDO tee "$ETC/cisco-totp" >/dev/null)
+		$SUDO chmod 600 "$ETC/cisco-totp"
+		echo "сохранён в $ETC/cisco-totp (читает только root); сейчас код: $code"
+	fi
+elif [ -n "${CVPN_CISCO_TOTP:-}" ]; then
+	/usr/local/bin/cvpn totp <<<"$CVPN_CISCO_TOTP"
+else
+	echo "TOTP: чтобы otp подставлялся сам, выполни: cvpn totp"
+fi
+
 # --- sudo без пароля -------------------------------------------------------
 
 sudo_user="${SUDO_USER:-$USER}"
@@ -240,6 +262,7 @@ fi
 say "Готово"
 cat <<-EOF
 	  cvpn on [otp]      vless + cisco
+	  cvpn totp          секрет TOTP: otp подставится сам
 	  cvpn off           выключить всё
 	  cvpn               статус
 	  cvpn cisco|vless|wg on|off

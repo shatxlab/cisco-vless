@@ -44,9 +44,18 @@ Cisco Secure Client и другие VPN-клиенты перед работой
 | `cvpn wg on` / `off` | весь остальной трафик через WireGuard, выключает vless |
 | `cvpn vless boot on` / `off` | Linux: поднимать vless при загрузке |
 | `cvpn password` | сменить пароль Cisco |
+| `cvpn totp` | сохранить секрет TOTP: `otp` для Cisco подставляется сам |
 | `cvpn log` | логи cisco и vless |
 
 cisco совместим и с vless, и с wg; vless и wg — взаимоисключающие.
+
+## TOTP
+
+`cvpn totp` сохраняет секрет TOTP (то, что зашито в QR-код при настройке
+аутентификатора: base32 или ссылка `otpauth://...`) — на macOS в Keychain,
+на Linux в файл только для root. После этого `cvpn on` и `cvpn cisco on`
+сами считают код и не спрашивают OTP; `cvpn on 123456` по-прежнему
+работает. Секрет не лежит в `config`, он читается всем.
 
 ## Как это устроено
 
