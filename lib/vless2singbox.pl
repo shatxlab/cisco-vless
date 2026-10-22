@@ -60,6 +60,10 @@ my %tun = (
 	strict_route => JSON::PP::false,
 	stack        => 'system',
 );
+# Linux: стек system принимает TCP из tun на свой порт через ядро — как входящее
+# соединение, и фаервол с deny incoming (ufw) его режет: DNS работает, TCP нет.
+# gvisor держит TCP в самом sing-box и мимо INPUT не ходит.
+$tun{stack} = 'gvisor' if $^O eq 'linux';
 # Linux: имя закрепляем, иначе после рестарта sing-box берёт первый свободный
 # tunN, а на имена завязан фаервол хоста. tun1 — cisco (cvpn, CISCO_TUN).
 $tun{interface_name} = 'tun0' if $^O eq 'linux';
