@@ -7,24 +7,29 @@
 #   vless — весь остальной трафик через VLESS (sing-box, tun).
 #   wg    — весь остальной трафик через WireGuard (если настроен).
 #   vless и wg взаимоисключающие: включение одного выключает другой.
+#   direct — Linux: запустить команду мимо vless и cisco (например тесты).
 #
 # Usage:
 #   cvpn [status]
 #   cvpn on [otp]            vless + cisco
 #   cvpn off                 выключить всё
 #   cvpn cisco on [otp]|off
+#   cvpn cisco reconnect     переподключить cisco (otp — из TOTP)
+#   cvpn cisco boot on|off   Linux: подключать cisco при загрузке (нужен TOTP)
 #   cvpn vless on|off
 #   cvpn vless boot on|off   Linux: поднимать vless при загрузке
+#   cvpn vless link          сменить ссылку vless:// (спросит или прочтёт из stdin)
 #   cvpn wg on|off
 #   cvpn password            сменить пароль Cisco
 #   cvpn totp                сохранить секрет TOTP: код для cisco подставится сам
 #   cvpn log                 логи cisco и vless
+#   cvpn direct <команда>    Linux: команда и её потомки идут мимо vless и cisco
 
 LIB=/usr/local/lib/cvpn
 ETC=/usr/local/etc/cvpn
 SELF="$LIB/cvpn"
 
-usage() { sed -n '12,22p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '13,27p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 if [ ! -f "$ETC/config" ]; then
 	echo "cvpn не установлен: нет $ETC/config. Запусти install.sh"
@@ -33,6 +38,8 @@ fi
 # shellcheck source=/dev/null
 . "$ETC/config"
 
+# PATH вызывающего — для команды cvpn direct.
+CALLER_PATH="$PATH"
 export PATH="${EXTRA_PATH:+$EXTRA_PATH:}/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 
 OS=$(uname -s)
@@ -43,16 +50,22 @@ PASSWORD_FILE="$ETC/cisco-password"
 TOTP_FILE="$ETC/cisco-totp"
 CISCO_PID=/var/run/cvpn-cisco.pid
 CISCO_LOG=/var/log/cvpn-cisco.log
+CISCO_UNIT=cvpn-cisco
 DNS_STATE=/var/run/cvpn-dns-domains
 SINGBOX_CONF="$ETC/singbox.json"
 VLESS_LOG=/var/log/cvpn-vless.log
 VLESS_UNIT=cvpn-vless
 WG_CONF="$ETC/cvpn-wg.conf"
 WG_IF=cvpn-wg
+DIRECT_MARK=0x6376
+DIRECT_TABLE=6376
+DIRECT_PRIO=50
 
 # Управляющие команды требуют root — поднимаемся через sudo сами.
 case "${1:-status}" in
 	status|log|help|-h|--help) ;;
+	# Команду запускаем от имени вызвавшего, root нужен только для _direct.
+	direct) ;;
 	password|totp) is_mac || [ "$(id -u)" -eq 0 ] || exec sudo "$SELF" "$@" ;;
 	*) [ "$(id -u)" -eq 0 ] || exec sudo "$SELF" "$@" ;;
 esac
@@ -211,6 +224,65 @@ cisco_off() {
 	dns_cleanup
 }
 
+# Linux: cisco при загрузке. Без TOTP спросить otp не у кого, поэтому он обязателен.
+# Unit пишем здесь, а не в install.sh, — чтобы работало и без переустановки.
+cisco_boot() {
+	if is_mac; then echo "cisco boot: только для Linux"; return 1; fi
+	local unit_file="/etc/systemd/system/$CISCO_UNIT.service"
+	case "${1:-}" in
+		on)
+			if [ ! -s "$TOTP_FILE" ]; then
+				echo "cisco boot: нет секрета TOTP — сначала cvpn totp"
+				return 1
+			fi
+			# oneshot: openconnect уходит в фон сам (--background) и остаётся в cgroup
+			# unit. Не подключился (сети ещё нет) — повтор через 30 с.
+			cat > "$unit_file" <<-EOF
+				[Unit]
+				Description=cvpn: Cisco AnyConnect (openconnect)
+				After=network-online.target
+				Wants=network-online.target
+
+				[Service]
+				Type=oneshot
+				RemainAfterExit=yes
+				ExecStart=$SELF cisco on
+				ExecStop=$SELF cisco off
+				TimeoutStartSec=120
+				Restart=on-failure
+				RestartSec=30
+
+				[Install]
+				WantedBy=multi-user.target
+			EOF
+			systemctl daemon-reload
+			systemctl enable "$CISCO_UNIT" 2>/dev/null && echo "cisco: будет подключаться при загрузке"
+			;;
+		off)
+			systemctl disable "$CISCO_UNIT" 2>/dev/null
+			echo "cisco: при загрузке не подключается"
+			;;
+		*) echo "Usage: cvpn cisco boot on|off"; return 1 ;;
+	esac
+}
+
+# Если включён boot — через unit: openconnect окажется в нём, а неудачное
+# подключение systemd повторит сам.
+cisco_reconnect() {
+	cisco_off
+	if ! is_mac && systemctl is-enabled --quiet "$CISCO_UNIT" 2>/dev/null; then
+		if systemctl restart "$CISCO_UNIT" && cisco_up; then
+			echo "cisco: подключён ($CISCO_UNIT)"
+		else
+			echo "cisco: не подключился, systemd повторит через 30 с. Лог:"
+			journalctl -u "$CISCO_UNIT" -n 15 --no-pager
+			return 1
+		fi
+	else
+		cisco_on
+	fi
+}
+
 # Linux: правила в обход tun sing-box.
 #  55 — трафик с адреса физического интерфейса (ответы на входящие, SSH)
 #       идёт через него, а не в tun;
@@ -225,6 +297,86 @@ linux_rules() {
 	src=$(ip -4 -o addr show dev "$dev" 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4; exit }')
 	[ -n "$src" ] && ip rule add priority 55 from "$src" lookup main
 	ip rule add priority 60 lookup main suppress_prefixlength 0
+}
+
+# Linux: cvpn direct. Процессы из scope cvpn-direct-*.scope идут мимо vless
+# и cisco. systemd кладёт cgroup scope в nft-set, nft метит пакеты из него,
+# правило 50 (раньше 55/60, правил sing-box и маршрутов cisco) отправляет
+# помеченное в таблицу только с физической сетью. Адрес источника сокет
+# выбрал ещё по маршруту в tun — его исправляет masquerade.
+# wg не обходится: wg-quick ставит свои правила раньше всех.
+direct_setup() {
+	local gw dev r
+	read -r gw dev <<<"$(phys_route)"
+	if [ -z "$gw" ]; then echo "direct: нет физической сети (не найден default)"; return 1; fi
+
+	# Таблицу не пересоздаём: в set могут быть scope идущих прогонов.
+	nft list table inet cvpn >/dev/null 2>&1 || nft -f - <<-EOF || return 1
+		table inet cvpn {
+			set direct {
+				type cgroupsv2
+			}
+			chain output {
+				type route hook output priority mangle; policy accept;
+				socket cgroupv2 level 2 @direct meta mark set $DIRECT_MARK
+			}
+			chain postrouting {
+				type nat hook postrouting priority srcnat; policy accept;
+				meta mark $DIRECT_MARK oifname != "lo" masquerade
+			}
+		}
+	EOF
+
+	# Физическая сеть могла смениться — маршруты обновляем каждый раз.
+	# shellcheck disable=SC2086 # маршрут из main раскладываем на аргументы
+	ip -4 route show table main dev "$dev" scope link | while read -r r; do
+		ip route replace $r dev "$dev" table "$DIRECT_TABLE"
+	done
+	ip route replace default via "$gw" dev "$dev" table "$DIRECT_TABLE"
+	ip -4 rule show priority "$DIRECT_PRIO" | grep -q "fwmark $DIRECT_MARK" ||
+		ip rule add priority "$DIRECT_PRIO" fwmark "$DIRECT_MARK" lookup "$DIRECT_TABLE"
+}
+
+direct_down() {
+	ip rule del priority "$DIRECT_PRIO" 2>/dev/null
+	ip route flush table "$DIRECT_TABLE" 2>/dev/null
+	nft delete table inet cvpn 2>/dev/null
+	return 0
+}
+
+# Перенести процесс $1 в scope мимо VPN. Через sudo — только свой процесс.
+direct_attach() {
+	local pid="${1:-}" unit _
+	case "$pid" in ''|*[!0-9]*) echo "Usage: cvpn _direct <pid>|down"; return 1 ;; esac
+	if [ "$(stat -c %u "/proc/$pid" 2>/dev/null)" != "${SUDO_UID:-0}" ]; then
+		echo "direct: процесс $pid не твой"
+		return 1
+	fi
+	direct_setup || return 1
+
+	# NFTSet (cgroup=3, inet=1) — то же, что -p NFTSet=cgroup:inet:cvpn:direct
+	# у systemd-run, но для уже запущенного процесса: окружение, каталог и
+	# пользователь команды не меняются.
+	unit="cvpn-direct-$pid.scope"
+	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+		StartTransientUnit 'ssa(sv)a(sa(sv))' "$unit" fail 3 \
+		PIDs au 1 "$pid" Slice s system.slice NFTSet 'a(iiss)' 1 3 1 cvpn direct \
+		0 >/dev/null || return 1
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		systemctl is-active --quiet "$unit" && return 0
+		sleep 0.2
+	done
+	echo "direct: $unit не запустился"
+	return 1
+}
+
+direct() {
+	if is_mac; then echo "direct: только для Linux"; exit 1; fi
+	if [ $# -eq 0 ]; then echo "Usage: cvpn direct <команда> [аргументы]"; exit 1; fi
+	wg_up && echo "direct: ВНИМАНИЕ: wg включён и не обходится — трафик пойдёт в wg" >&2
+	if [ "$(id -u)" -eq 0 ]; then direct_attach $$; else sudo "$SELF" _direct $$; fi || exit 1
+	export PATH="$CALLER_PATH"
+	exec "$@"
 }
 
 vless_on() {
@@ -267,6 +419,34 @@ vless_boot() {
 		off) systemctl disable "$VLESS_UNIT" 2>/dev/null && echo "vless: при загрузке не включается" ;;
 		*)   echo "Usage: cvpn vless boot on|off"; return 1 ;;
 	esac
+}
+
+# Сменить ссылку VLESS: пересобрать singbox.json с теми же адресами в обход
+# tun (шлюз cisco, DNS провайдера). Ссылка не идёт аргументом — иначе она
+# останется в истории шелла и видна в ps.
+vless_link() {
+	local link excl tmp
+	if [ ! -f "$LIB/vless2singbox.pl" ]; then
+		echo "vless: нет $LIB/vless2singbox.pl — переустанови cvpn (install.sh)"
+		return 1
+	fi
+	read -rsp 'Ссылка vless://... (не отображается): ' link
+	[ -t 0 ] && echo
+	if [[ "$link" != vless://* ]]; then echo "vless: нужна ссылка vless://"; return 1; fi
+
+	excl=$(perl -MJSON::PP -e 'local $/; print join " ", @{ decode_json(<STDIN>)->{inbounds}[0]{route_exclude_address} || [] }' \
+		< "$SINGBOX_CONF") || return 1
+	tmp=$(mktemp)
+	# shellcheck disable=SC2086 # excl — список адресов через пробел
+	if ! perl "$LIB/vless2singbox.pl" "$link" $excl > "$tmp" || ! sing-box check -c "$tmp"; then
+		rm -f "$tmp"
+		echo "vless: конфиг не собран, старая ссылка не тронута"
+		return 1
+	fi
+	install -m 600 "$tmp" "$SINGBOX_CONF"
+	rm -f "$tmp"
+	echo "vless: ссылка сохранена"
+	if vless_up; then vless_off && vless_on; fi
 }
 
 wg_on() {
@@ -350,7 +530,9 @@ sub_cmd() {
 	case "${2:-}" in
 		on)   "$1_on" "${@:3}" ;;
 		off)  "$1_off" ;;
-		boot) if [ "$1" = vless ]; then vless_boot "${@:3}"; else usage; exit 1; fi ;;
+		boot) if [ "$1" != wg ]; then "$1_boot" "${@:3}"; else usage; exit 1; fi ;;
+		link) if [ "$1" = vless ]; then vless_link; else usage; exit 1; fi ;;
+		reconnect) if [ "$1" = cisco ]; then cisco_reconnect; else usage; exit 1; fi ;;
 		*)    echo "Usage: cvpn $1 on|off"; exit 1 ;;
 	esac
 }
@@ -370,6 +552,8 @@ case "${1:-status}" in
 		echo "== vless"
 		if is_mac; then tail -20 "$VLESS_LOG" 2>/dev/null; else journalctl -u "$VLESS_UNIT" -n 20 --no-pager 2>/dev/null; fi
 		;;
+	direct)   direct "${@:2}" ;;
 	_rules)   linux_rules "${2:-}" ;;
+	_direct)  if [ "${2:-}" = down ]; then direct_down; else direct_attach "${2:-}"; fi ;;
 	*)        usage; exit 1 ;;
 esac

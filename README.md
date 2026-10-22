@@ -40,14 +40,38 @@ Cisco Secure Client и другие VPN-клиенты перед работой
 | `cvpn on [otp]` | vless + cisco |
 | `cvpn off` | выключить всё |
 | `cvpn cisco on [otp]` / `off` | только корп-сеть |
+| `cvpn cisco reconnect` | переподключить cisco — например, из cron (нужен TOTP) |
+| `cvpn cisco boot on` / `off` | Linux: подключать cisco при загрузке (нужен TOTP) |
 | `cvpn vless on` / `off` | весь остальной трафик через VLESS, выключает wg |
 | `cvpn wg on` / `off` | весь остальной трафик через WireGuard, выключает vless |
 | `cvpn vless boot on` / `off` | Linux: поднимать vless при загрузке |
+| `cvpn vless link` | сменить ссылку `vless://` — спросит или прочтёт из stdin; если vless включён, перезапустит |
 | `cvpn password` | сменить пароль Cisco |
 | `cvpn totp` | сохранить секрет TOTP: `otp` для Cisco подставляется сам |
 | `cvpn log` | логи cisco и vless |
+| `cvpn direct <команда>` | Linux: команда и её потомки идут мимо vless и cisco |
 
 cisco совместим и с vless, и с wg; vless и wg — взаимоисключающие.
+
+## Мимо VPN: `cvpn direct`
+
+```
+cvpn direct pnpm qa:regression
+```
+
+Команда запускается от твоего имени, с тем же окружением и каталогом, но её
+трафик (и всех потомков — браузеров Playwright, например) идёт напрямую через
+физическую сеть: мимо vless и мимо корп-сетей cisco. Остальные программы
+работают как раньше. Нужен sudo без пароля для `cvpn` (его предлагает
+установщик) — иначе из cron не запустится.
+
+Как устроено: процесс попадает в systemd-scope `cvpn-direct-<pid>`, systemd
+кладёт его cgroup в nft-set `inet cvpn direct`, nft метит пакеты (0x6376),
+правило `ip rule` 50 отправляет их в таблицу 6376 только с физическим
+default, masquerade поправляет адрес источника.
+
+Не обходится: DNS — имена резолвит systemd-resolved как обычно (при vless —
+через VLESS, корп-домены — через cisco); wg — его правила идут раньше.
 
 ## TOTP
 

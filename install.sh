@@ -178,7 +178,7 @@ PATH="${EXTRA_PATH:+$EXTRA_PATH:}$PATH" sing-box check -c "$tmp/singbox.json" ||
 say "Файлы: $LIB, $ETC, /usr/local/bin/cvpn"
 $SUDO mkdir -p "$LIB" "$ETC" /usr/local/bin
 $SUDO install -m 755 bin/cvpn lib/vpnc-wrapper.sh "$LIB/"
-$SUDO install -m 755 lib/totp.pl "$LIB/"
+$SUDO install -m 755 lib/totp.pl lib/vless2singbox.pl "$LIB/"
 $SUDO install -m 644 "$tmp/config" "$ETC/config"
 $SUDO install -m 600 "$tmp/singbox.json" "$ETC/singbox.json"
 if [ -n "$WG_CONF" ]; then $SUDO install -m 600 "$WG_CONF" "$ETC/cvpn-wg.conf"; fi

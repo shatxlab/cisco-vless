@@ -10,8 +10,9 @@ SUDO=sudo
 [ -x "$LIB/cvpn" ] && $SUDO "$LIB/cvpn" off
 
 if [ "$(uname -s)" = Linux ]; then
-	$SUDO systemctl disable --now cvpn-vless >/dev/null 2>&1
-	$SUDO rm -f /etc/systemd/system/cvpn-vless.service
+	[ -x "$LIB/cvpn" ] && $SUDO "$LIB/cvpn" _direct down
+	$SUDO systemctl disable --now cvpn-vless cvpn-cisco >/dev/null 2>&1
+	$SUDO rm -f /etc/systemd/system/cvpn-vless.service /etc/systemd/system/cvpn-cisco.service
 	$SUDO systemctl daemon-reload
 else
 	# shellcheck source=/dev/null
