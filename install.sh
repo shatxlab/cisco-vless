@@ -44,10 +44,18 @@ ask() {
 	if [ -n "$secret" ]; then
 		read -rsp "$q: " ans
 		echo
+		drain_input
 	else
 		read -rp "$q${def:+ [$def]}: " ans
 	fi
 	printf -v "$var" '%s' "${ans:-$def}"
+}
+
+# Выкинуть набранное наперёд: вставка секрета с переводом строки + Enter
+# следом иначе молча отвечает пустой строкой на следующий вопрос.
+drain_input() {
+	[ -t 0 ] || return 0
+	while read -rs -t 1 _; do :; done
 }
 
 yes_no() {
@@ -141,7 +149,7 @@ CISCO_IP=$(dig +short +time=3 +tries=1 "$CISCO_HOST" | grep -E '^[0-9.]+$' | hea
 
 CISCO_PIN="${CVPN_CISCO_PIN:-}"
 if [ -z "$CISCO_PIN" ]; then
-	pin=$(cert_pin "$CISCO_HOST")
+	pin=$(cert_pin "$CISCO_HOST" || true)
 	[ -n "$pin" ] || die "не удалось получить сертификат $CISCO_HOST"
 	CISCO_PIN="pin-sha256:$pin"
 	say "Сертификат $CISCO_HOST ($CISCO_IP): $CISCO_PIN"
@@ -211,12 +219,14 @@ fi
 say "Пароль Cisco"
 if [ "$OS" = Darwin ]; then
 	/usr/local/bin/cvpn password
+	drain_input
 elif [ -n "${CVPN_CISCO_PASSWORD:-}" ]; then
 	(umask 077; printf '%s' "$CVPN_CISCO_PASSWORD" | $SUDO tee "$ETC/cisco-password" >/dev/null)
 	$SUDO chmod 600 "$ETC/cisco-password"
 	echo "сохранён в $ETC/cisco-password (читает только root)"
 else
 	$SUDO /usr/local/bin/cvpn password
+	drain_input
 fi
 
 # --- TOTP Cisco -------------------------------------------------------------
